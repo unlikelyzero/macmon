@@ -192,6 +192,24 @@ macmon_cpu_tier_active_ratio{chip="Apple M3 Pro",tier="P"} 0.04
 
 `macmon_ecpu_*` and `macmon_pcpu_*` are still exported for the lowest and the highest tier. In a macOS VM the power and frequency gauges are left out.
 
+`macmon serve --process-metrics` adds a counter per process with GPU time, read on each scrape and counted from the start of `serve`:
+
+```
+# HELP macmon_process_gpu_time_seconds_total GPU time of a process in seconds, summed across its command queues
+# TYPE macmon_process_gpu_time_seconds_total counter
+macmon_process_gpu_time_seconds_total{chip="Apple M3 Pro",pid="412",name="WindowServer"} 1532.8
+macmon_process_gpu_time_seconds_total{chip="Apple M3 Pro",pid="75545",name="llama-server"} 0.073
+```
+
+`rate()` of it is accumulated GPU time, summed across the command queues of the process, so it can go above 1 when they run at the same time. It's off by default for two reasons: `serve` has no authentication and listens on `0.0.0.0` unless `--host` says otherwise, so the series show the pid and name of every process using the GPU, of any user, to anyone who can reach the port; and each new pid is a new series, which adds up on a long-running Prometheus. To keep the noisy ones out, in the scrape config:
+
+```yaml
+metric_relabel_configs:
+  - source_labels: [__name__, name]
+    regex: macmon_process_gpu_time_seconds_total;(Safari|Google Chrome.*)
+    action: drop
+```
+
 </details>
 
 ### Stress testing

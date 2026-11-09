@@ -105,6 +105,7 @@ unsafe extern "C" {
 unsafe extern "C" {
   fn IOServiceMatching(name: *const c_char) -> CFDictionaryRef;
   fn IOServiceGetMatchingServices(main_port: u32, matching: CFDictionaryRef, existing: *mut u32) -> c_int;
+  fn IORegistryEntryGetRegistryEntryID(entry: u32, id: *mut u64) -> c_int;
   fn IORegistryEntryGetChildIterator(entry: u32, plane: *const c_char, iterator: *mut u32) -> c_int;
   fn IORegistryEntryCreateCFProperty(entry: u32, key: CFStringRef, allocator: CFAllocatorRef, options: u32) -> CFTypeRef;
   fn IOIteratorNext(iterator: u32) -> u32;
@@ -257,6 +258,17 @@ pub(crate) fn bsd_info(pid: i32) -> Option<libc::proc_bsdinfo> {
   let ptr = &mut info as *mut libc::proc_bsdinfo as *mut c_void;
   let read = unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, ptr, size) };
   (read == size).then_some(info)
+}
+
+/// Start time of a process of any user, None once it's gone. libc doesn't bind `kinfo_proc`,
+/// which is 648 bytes and opens with `p_starttime`, a `timeval`.
+fn start_time(pid: i32) -> Option<(i64, i32)> {
+  let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid];
+  let mut buf = [0u64; 81];
+  let mut size = mem::size_of_val(&buf);
+  let ptr = buf.as_mut_ptr().cast();
+  let ret = unsafe { libc::sysctl(mib.as_mut_ptr(), 4, ptr, &mut size, std::ptr::null_mut(), 0) };
+  (ret == 0 && size == mem::size_of_val(&buf)).then_some((buf[0] as i64, buf[1] as i32))
 }
 
 fn rusage(pid: i32, flavor: c_int) -> Option<rusage_info_v6> {
@@ -532,6 +544,13 @@ impl Drop for IoObject {
 }
 
 impl IoObject {
+  /// Id of a registry entry, the same for its whole life and never used again.
+  fn entry_id(&self) -> Option<u64> {
+    let mut id = 0;
+    let ret = unsafe { IORegistryEntryGetRegistryEntryID(self.0, &mut id) };
+    (ret == 0).then_some(id)
+  }
+
   /// Copy of a registry entry property, None when it's missing.
   fn property(&self, key: &CFString) -> Option<CFType> {
     let key = key.as_concrete_TypeRef();
@@ -602,48 +621,58 @@ fn app_usage_ns(usage: &CFType) -> u64 {
   entries.iter().filter_map(|entry| entry_ns(*entry)).fold(0, u64::saturating_add)
 }
 
-/// `(pid, GPU time in ns)` of every GPU user client. The clients are unregistered children of
-/// the `IOAccelerator` services, so they're only found by walking the service plane.
-fn read_gpu_clients() -> Option<Vec<(i32, u64)>> {
+/// A GPU user client of a process.
+struct GpuClient {
+  id: u64,
+  pid: i32,
+  /// GPU time in ns, None without `AppUsage`.
+  gpu_ns: Option<u64>,
+}
+
+/// Every GPU user client and whether the walk saw all of them. The clients are unregistered
+/// children of the `IOAccelerator` services, so they're only found by walking the service plane.
+fn read_gpu_clients() -> Option<(Vec<GpuClient>, bool)> {
   let creator_key = CFString::from_static_string("IOUserClientCreator");
   let usage_key = CFString::from_static_string("AppUsage");
   let mut clients = Vec::new();
+  let mut complete = true;
 
   for gpu in matching_services(c"IOAccelerator")? {
     // Clients come and go; a registry change mid-walk invalidates the iterator, so walk again.
-    walk_until_consistent(&mut clients, 3, |clients| {
+    complete &= walk_until_consistent(&mut clients, 3, |clients| {
       let mut iter = children(&gpu)?;
       for client in iter.by_ref() {
         let creator = client.property(&creator_key).and_then(|v| v.downcast_into::<CFString>());
-        let Some(pid) = creator.and_then(|creator| parse_creator(&creator.to_string())) else {
-          continue;
-        };
-        let gpu_ns = client.property(&usage_key).map_or(0, |usage| app_usage_ns(&usage));
-        clients.push((pid, gpu_ns));
+        let pid = creator.and_then(|creator| parse_creator(&creator.to_string()));
+        let (Some(id), Some(pid)) = (client.entry_id(), pid) else { continue };
+        let gpu_ns = client.property(&usage_key).map(|usage| app_usage_ns(&usage));
+        clients.push(GpuClient { id, pid, gpu_ns });
       }
       Some(iter.is_valid())
     })?;
   }
 
-  Some(clients)
+  Some((clients, complete))
 }
 
 /// Runs `walk` (it adds items to `items` and returns whether the walk was consistent) up to
 /// `attempts` times, until a walk is consistent; the items of an inconsistent walk are dropped,
-/// except the last one's. `None` from `walk` stops it.
+/// except the last one's. Whether the last walk was consistent; `None` from `walk` stops it.
 fn walk_until_consistent<T>(
   items: &mut Vec<T>,
   attempts: usize,
   mut walk: impl FnMut(&mut Vec<T>) -> Option<bool>,
-) -> Option<()> {
+) -> Option<bool> {
+  let mut consistent = false;
   for attempt in 1..=attempts {
     let start = items.len();
-    if walk(items)? || attempt == attempts {
+    consistent = walk(items)?;
+    if consistent || attempt == attempts {
       break;
     }
     items.truncate(start);
   }
-  Some(())
+  Some(consistent)
 }
 
 /// GPU time per pid; a process may own several clients.
@@ -658,7 +687,67 @@ fn sum_gpu_times(clients: impl IntoIterator<Item = (i32, u64)>) -> HashMap<i32, 
 
 /// GPU time per pid, empty when the IORegistry isn't readable.
 fn gpu_times() -> HashMap<i32, u64> {
-  read_gpu_clients().map(sum_gpu_times).unwrap_or_default()
+  let clients = read_gpu_clients().map_or_else(Vec::new, |x| x.0);
+  sum_gpu_times(clients.iter().map(|x| (x.pid, x.gpu_ns.unwrap_or(0))))
+}
+
+/// What tells a process from a later one under its pid: its start time and executable name.
+type ProcId = ((i64, i32), String);
+
+fn proc_id(pid: i32) -> Option<ProcId> {
+  let name = exe_path(pid).as_deref().and_then(basename).unwrap_or_default().to_string();
+  Some((start_time(pid)?, name))
+}
+
+/// GPU time of every process as a counter that only grows, for Prometheus. The GPU time of a
+/// process drops when one of its GPU clients closes, which `rate()` would read as a restart from
+/// zero and count the rest again, so it adds up what each client ran between two readings.
+#[derive(Default)]
+pub struct GpuCounters {
+  /// Last GPU time of each client by IORegistry entry id, None before the first complete reading.
+  clients: Option<HashMap<u64, u64>>,
+  /// The process and its GPU time counted so far, by pid.
+  procs: HashMap<i32, (ProcId, u64)>,
+}
+
+impl GpuCounters {
+  /// `(pid, name, GPU seconds)` of the processes with GPU time, by pid. An IORegistry that can't
+  /// be read in full leaves the counters alone: the clients it misses aren't closed.
+  pub fn sample(&mut self) -> Vec<(i32, String, f64)> {
+    if let Some((clients, true)) = read_gpu_clients() {
+      self.update(clients, proc_id);
+    }
+    self.rows()
+  }
+
+  fn update(&mut self, read: Vec<GpuClient>, proc_id: impl Fn(i32) -> Option<ProcId>) {
+    // The first reading is only the baseline: what ran before the exporter isn't a burst now.
+    let first = self.clients.is_none();
+    let last = self.clients.take().unwrap_or_default();
+    // A process keeps its counter without clients, until it ends or another one takes the pid.
+    self.procs.retain(|pid, (id, _)| proc_id(*pid).as_ref() == Some(id));
+
+    let mut clients = HashMap::with_capacity(read.len());
+    for client in read {
+      let known = last.get(&client.id).copied();
+      // without a reading a client keeps its baseline
+      let Some(gpu_ns) = client.gpu_ns.or(known) else { continue };
+      clients.insert(client.id, gpu_ns);
+
+      let Some(id) = proc_id(client.pid).filter(|_| gpu_ns > 0) else { continue };
+      let ran = if first { 0 } else { gpu_ns.saturating_sub(known.unwrap_or(0)) };
+      let (_, total) = self.procs.entry(client.pid).or_insert((id, 0));
+      *total = total.saturating_add(ran);
+    }
+    self.clients = Some(clients);
+  }
+
+  fn rows(&self) -> Vec<(i32, String, f64)> {
+    let row = |(pid, (id, ns)): (&i32, &(ProcId, u64))| (*pid, id.1.clone(), *ns as f64 / 1e9);
+    let mut rows: Vec<_> = self.procs.iter().map(row).collect();
+    rows.sort_by_key(|x| x.0);
+    rows
+  }
 }
 
 // MARK: Sampler
@@ -888,6 +977,86 @@ mod tests {
     // a new process under the same pid: no spike from its GPU time
     let reused = Counters { start: 43, ..gpu(SEC, Some(SEC)) };
     assert_eq!(usage(Some(&gpu(0, Some(0))), &reused, SEC).gpu_pct, 0.0);
+  }
+
+  fn gpu_id(pid: i32, start: i64) -> Option<ProcId> {
+    Some(((start, 0), format!("p{pid}")))
+  }
+
+  /// `(client id, pid, GPU time in seconds)` of the clients read.
+  fn gpu_read(clients: &[(u64, i32, u64)]) -> Vec<GpuClient> {
+    let client =
+      |&(id, pid, secs): &(u64, i32, u64)| GpuClient { id, pid, gpu_ns: Some(secs * SEC) };
+    clients.iter().map(client).collect()
+  }
+
+  #[test]
+  fn gpu_counters_only_grow() {
+    let mut counters = GpuCounters::default();
+    let row = |pid: i32, secs: f64| (pid, format!("p{pid}"), secs);
+    let mut read = |clients: &[(u64, i32, u64)]| {
+      counters.update(gpu_read(clients), |pid| gpu_id(pid, 1));
+      counters.rows()
+    };
+
+    // what ran before the exporter isn't counted; no GPU time: no series
+    assert_eq!(read(&[(10, 1, 5), (20, 2, 0)]), [row(1, 0.0)]);
+    assert_eq!(read(&[(10, 1, 7), (20, 2, 1)]), [row(1, 2.0), row(2, 1.0)]);
+    // a new client counts from zero
+    assert_eq!(read(&[(10, 1, 7), (11, 1, 1), (20, 2, 1)]), [row(1, 3.0), row(2, 1.0)]);
+    // a client closed: the time of the others stays and grows
+    assert_eq!(read(&[(11, 1, 2), (20, 2, 1)]), [row(1, 4.0), row(2, 1.0)]);
+    // the last clients closed: the process is still there
+    assert_eq!(read(&[(20, 2, 1)]), [row(1, 4.0), row(2, 1.0)]);
+  }
+
+  #[test]
+  fn gpu_counters_keep_the_baseline_of_a_client_without_a_reading() {
+    let mut counters = GpuCounters::default();
+    counters.update(gpu_read(&[(10, 1, 5)]), |pid| gpu_id(pid, 1));
+    let unread = vec![GpuClient { id: 10, pid: 1, gpu_ns: None }];
+    counters.update(unread, |pid| gpu_id(pid, 1));
+    counters.update(gpu_read(&[(10, 1, 6)]), |pid| gpu_id(pid, 1));
+    assert_eq!(counters.rows(), [(1, "p1".to_string(), 1.0)]);
+  }
+
+  #[test]
+  fn gpu_counters_end_with_the_process() {
+    let mut counters = GpuCounters::default();
+    counters.update(gpu_read(&[(10, 1, 5), (20, 2, 5)]), |pid| gpu_id(pid, 1));
+    counters.update(gpu_read(&[(10, 1, 6), (20, 2, 6)]), |pid| gpu_id(pid, 1));
+
+    // pid 1 is gone, pid 2 is a new process under the same name
+    counters.update(gpu_read(&[(21, 2, 3)]), |pid| (pid == 2).then(|| gpu_id(pid, 2)).flatten());
+    assert_eq!(counters.rows(), [(2, "p2".to_string(), 3.0)]);
+  }
+
+  #[test]
+  fn start_time_reads_a_process_and_not_a_gone_one() {
+    let me = bsd_info(std::process::id() as i32).unwrap();
+    let start = (me.pbi_start_tvsec as i64, me.pbi_start_tvusec as i32);
+    assert_eq!(start_time(std::process::id() as i32), Some(start));
+    assert!(start_time(1).is_some(), "another user's process");
+    assert_eq!(start_time(i32::MAX), None);
+  }
+
+  #[test]
+  fn an_inconsistent_walk_is_reported() {
+    let mut items = Vec::new();
+    let mut walks = 0;
+    let consistent = walk_until_consistent(&mut items, 3, |items| {
+      walks += 1;
+      items.push(walks);
+      Some(false)
+    });
+    assert_eq!((consistent, items), (Some(false), vec![3]));
+
+    let mut items = Vec::new();
+    let consistent = walk_until_consistent(&mut items, 3, |items| {
+      items.push(1);
+      Some(true)
+    });
+    assert_eq!(consistent, Some(true));
   }
 
   #[test]

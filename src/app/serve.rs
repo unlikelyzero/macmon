@@ -5,7 +5,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::process::Command;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
 
@@ -13,6 +13,7 @@ use macmon::sources::WithError;
 use macmon::{Metrics, SocInfo};
 
 use crate::metrics_to_json_value;
+use crate::procs::GpuCounters;
 
 pub type SharedMetrics = Arc<RwLock<Option<Metrics>>>;
 
@@ -144,6 +145,25 @@ fn to_prometheus(m: &Metrics, soc: &SocInfo) -> String {
   out
 }
 
+/// The GPU time counter with a series per process of `procs`: `(pid, name, GPU seconds)`.
+fn gpu_time_to_prometheus(procs: &[(i32, String, f64)], soc: &SocInfo) -> String {
+  if procs.is_empty() {
+    return String::new();
+  }
+
+  let name = "macmon_process_gpu_time_seconds_total";
+  let chip = escape_label_value(&soc.chip_name);
+  let help = "GPU time of a process in seconds, summed across its command queues";
+  let mut out = format!("# HELP {name} {help}\n# TYPE {name} counter\n");
+  for (pid, proc_name, secs) in procs {
+    let proc_name = escape_label_value(proc_name);
+    let labels = format!(r#"chip="{chip}",pid="{pid}",name="{proc_name}""#);
+    out.push_str(&format!("{name}{{{labels}}} {secs}\n"));
+  }
+  out.push('\n');
+  out
+}
+
 fn to_json(m: &Metrics, soc: &SocInfo) -> String {
   let mut doc = metrics_to_json_value(m).unwrap_or_default();
   doc["soc"] = serde_json::to_value(soc).unwrap_or_default();
@@ -194,7 +214,12 @@ fn escape_xml(value: &str) -> String {
     .replace('\'', "&apos;")
 }
 
-fn handle_conn(mut stream: TcpStream, shared: SharedMetrics, soc: Arc<SocInfo>) {
+fn handle_conn(
+  mut stream: TcpStream,
+  shared: SharedMetrics,
+  soc: Arc<SocInfo>,
+  gpu: Option<Arc<Mutex<GpuCounters>>>,
+) {
   let path = match read_path(&mut stream) {
     Some(p) => p,
     None => return,
@@ -220,8 +245,13 @@ fn handle_conn(mut stream: TcpStream, shared: SharedMetrics, soc: Arc<SocInfo>) 
       write_response(&mut stream, 200, "application/json", body);
     }
     "/metrics" => {
-      let body = to_prometheus(m, &soc);
+      let mut body = to_prometheus(m, &soc);
       drop(lock);
+      // Read on a scrape: /json and the sampling loop don't pay for it. A poisoned lock leaves the
+      // section out and the rest of /metrics works.
+      if let Some(Ok(mut gpu)) = gpu.as_deref().map(Mutex::lock) {
+        body.push_str(&gpu_time_to_prometheus(&gpu.sample(), &soc));
+      }
       write_response(&mut stream, 200, "text/plain; version=0.0.4; charset=utf-8", body);
     }
     _ => {
@@ -231,17 +261,23 @@ fn handle_conn(mut stream: TcpStream, shared: SharedMetrics, soc: Arc<SocInfo>) 
   }
 }
 
-pub fn run(host: &str, port: u16, shared: SharedMetrics, soc: Arc<SocInfo>) -> WithError<()> {
+pub fn run(
+  host: &str,
+  port: u16,
+  shared: SharedMetrics,
+  soc: Arc<SocInfo>,
+  process_metrics: bool,
+) -> WithError<()> {
   let listener = TcpListener::bind((host, port))?;
   eprintln!("macmon serving on http://{}", listener.local_addr()?);
   eprintln!("  GET /json    → JSON metrics");
   eprintln!("  GET /metrics → Prometheus format");
 
+  let gpu = process_metrics.then(|| Arc::new(Mutex::new(GpuCounters::default())));
   for stream in listener.incoming() {
     let Ok(stream) = stream else { continue };
-    let shared = Arc::clone(&shared);
-    let soc = Arc::clone(&soc);
-    thread::spawn(move || handle_conn(stream, shared, soc));
+    let (shared, soc, gpu) = (Arc::clone(&shared), Arc::clone(&soc), gpu.clone());
+    thread::spawn(move || handle_conn(stream, shared, soc, gpu));
   }
 
   Ok(())
@@ -430,7 +466,8 @@ mod tests {
   use macmon::{CpuTierMetrics, Metrics, SocInfo};
 
   use super::{
-    daemon_user, escape_label_value, escape_xml, plist_text, serve_url, to_json, to_prometheus,
+    daemon_user, escape_label_value, escape_xml, gpu_time_to_prometheus, plist_text, serve_url,
+    to_json, to_prometheus,
   };
 
   const AGENT_PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -591,6 +628,18 @@ mod tests {
     // a VM: the same without the power and frequency gauges
     let expected = mac.iter().filter(|x| !power.contains(x) && !freqs.contains(&x.as_str()));
     assert_eq!(types(true), expected.cloned().collect::<Vec<_>>());
+  }
+
+  #[test]
+  fn process_gpu_time_is_a_counter_with_a_series_per_process() {
+    assert_eq!(gpu_time_to_prometheus(&[], &SocInfo::default()), "");
+
+    let procs = [(7, "a\"b".to_string(), 0.073), (8, "c".to_string(), 12.0)];
+    let output = gpu_time_to_prometheus(&procs, &SocInfo::default());
+    let name = "macmon_process_gpu_time_seconds_total";
+    assert!(output.contains(&format!("# TYPE {name} counter\n")));
+    assert!(output.contains(&format!("{name}{{{}}} 0.073\n", r#"chip="",pid="7",name="a\"b""#)));
+    assert!(output.contains(&format!("{name}{{{}}} 12\n", r#"chip="",pid="8",name="c""#)));
   }
 
   #[test]

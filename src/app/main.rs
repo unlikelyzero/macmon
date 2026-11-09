@@ -93,6 +93,13 @@ enum Commands {
     /// With --install: a LaunchAgent that starts at login instead, no sudo
     #[arg(long, default_value_t = false, requires = "install")]
     agent: bool,
+
+    /// Export GPU time per process at /metrics, with the pid and name of every process that uses
+    /// the GPU, of any user, to anyone who can reach the port
+    // ponytail: not for --install, whose plist has fixed arguments; pass it through if wanted
+    // there.
+    #[arg(long, default_value_t = false, conflicts_with = "install")]
+    process_metrics: bool,
   },
 
   /// Print debug information
@@ -297,7 +304,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
       }
     }
-    Some(Commands::Serve { host, port, install, uninstall, agent }) => {
+    Some(Commands::Serve { host, port, install, uninstall, agent, process_metrics }) => {
       if *install && *agent {
         return serve::install_agent(host, *port);
       }
@@ -319,9 +326,9 @@ fn main() -> Result<(), Box<dyn Error>> {
       let shared_http = Arc::clone(&shared);
       let soc_http = Arc::clone(&soc);
       let host = host.clone();
-      let port = *port;
+      let (port, process_metrics) = (*port, *process_metrics);
       thread::spawn(move || {
-        if let Err(e) = serve::run(&host, port, shared_http, soc_http) {
+        if let Err(e) = serve::run(&host, port, shared_http, soc_http, process_metrics) {
           eprintln!("server error: {e}");
           std::process::exit(1); // without HTTP there is nothing to run for; launchd retries
         }
